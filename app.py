@@ -11,6 +11,9 @@ from dotenv import load_dotenv
 import os
 import redis
 from cryptography.fernet import Fernet
+import string
+import random
+import secrets
 
 app = Flask(__name__)
 
@@ -42,6 +45,29 @@ def encrypt_secret(secret: str) -> str:
 
 def decrypt_secret(encrypted_secret: str) -> str:
     return fernet.decrypt(encrypted_secret.encode()).decode()
+
+
+
+def generate_backup_codes(n=10, length=8):
+    """Generates a list of n random backup codes, each of specified length"""
+    alphabet = string.ascii_uppercase + string.digits
+    return [''.join(secrets.choice(alphabet) for _ in range(length)) for _ in range(n)]
+
+def store_backup_codes(user_id, codes):
+    """Stores the list of backup codes in the backup_codes table, each as a separate record"""
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor()
+
+    for code in codes:
+        encrypted = encrypt_secret(code)
+        cur.execute(
+            "INSERT INTO backup_codes (user_id, code) VALUES (%s, %s)",
+            (user_id, encrypted)
+        )
+
+    conn.commit()
+    cur.close()
+    conn.close()
 
 def get_user_id_from_token():
     '''
@@ -151,14 +177,22 @@ def confirm_2fa():
     cur.close()
     conn.close()
 
+    # Po udanym potwierdzeniu 2FA
+    backup_codes = generate_backup_codes()
+    store_backup_codes(user_id, backup_codes)
+
     return jsonify({
-        "message": "2FA enabled"
+        "message": "2FA enabled",
+        "backup_codes": backup_codes  # shown only once to the user
     })
+
+
 
 @app.route("/disable-2fa", methods=["PATCH"])
 def disable_2fa():
     '''
-    Disables 2FA for the user by clearing the otp_secret and otp_temp_secret fields in the database and setting is_2fa_enabled to false
+    Disables 2FA for the user by clearing otp_secret, otp_temp_secret,
+    is_2fa_enabled, and deleting all backup codes for the user
     '''
     user_id = get_user_id_from_token()
     if not user_id:
@@ -168,6 +202,13 @@ def disable_2fa():
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
 
+        # remove backup codes
+        cur.execute("""
+            DELETE FROM backup_codes
+            WHERE user_id = %s
+        """, (user_id,))
+
+        # turn off 2FA and clear secrets
         cur.execute("""
             UPDATE users
             SET otp_secret = NULL,
@@ -180,7 +221,7 @@ def disable_2fa():
         cur.close()
         conn.close()
 
-        return jsonify({"message": "2FA disabled successfully"})
+        return jsonify({"message": "2FA disabled and backup codes removed successfully"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -297,6 +338,66 @@ def verify_2fa():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+from flask import Flask, request, jsonify
+
+@app.route("/verify-backup-code", methods=["DELETE"])
+def verify_backup_code():
+    '''Verifies the backup code entered by the user against the codes stored in the database'''
+    user_id = get_user_id_from_token()
+    code = request.json.get("code")
+
+    if not user_id or not code:
+        return jsonify({"error": "Invalid request"}), 400
+
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor()
+
+    # get all backup codes for the user
+    cur.execute("SELECT id, code FROM backup_codes WHERE user_id = %s", (user_id,))
+    rows = cur.fetchall()
+
+    if not rows:
+        cur.close()
+        conn.close()
+        return jsonify({"error": "No backup codes available"}), 400
+
+    matched_id = None
+    for row in rows:
+        backup_id, encrypted_code = row
+        if decrypt_secret(encrypted_code) == code:
+            matched_id = backup_id
+            break
+
+    if not matched_id:
+        cur.close()
+        conn.close()
+        return jsonify({"error": "Invalid backup code"}), 401
+
+    # delete the used backup code
+    cur.execute("DELETE FROM backup_codes WHERE id = %s", (matched_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    access_payload = {
+        "sub": user_id,
+        "2fa": True,
+        "exp": datetime.datetime.utcnow() + datetime.timedelta(minutes=15)
+    }
+    access_token = jwt.encode(access_payload, JWT_ACCESS_SECRET, algorithm="HS256")
+
+    refresh_payload = {
+        "sub": user_id,
+        "2fa": True,
+        "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+    }
+    refresh_token = jwt.encode(refresh_payload, JWT_REFRESH_SECRET, algorithm="HS256")
+
+    response = jsonify({"message": "Backup code verified"})
+    response.set_cookie("access_token", access_token, httponly=True, secure=False, samesite="lax", max_age=15*60)
+    response.set_cookie("refresh_token", refresh_token, httponly=True, secure=False, samesite="lax", max_age=60*60)
+
+    return response
 
 if __name__ == "__main__":
     app.run(debug=True)
