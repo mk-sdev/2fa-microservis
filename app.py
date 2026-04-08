@@ -10,6 +10,7 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 import os
 import redis
+from cryptography.fernet import Fernet
 
 app = Flask(__name__)
 
@@ -32,7 +33,15 @@ JWT_REFRESH_SECRET = os.getenv("JWT_REFRESH_SECRET")
 JWT_2FA_SECRET = os.getenv("JWT_2FA_SECRET")
 DATABASE_URL = os.getenv("DATABASE_URL")
 ISSUER = "IAM System"
+FERNET_KEY = os.getenv("TOTP_ENCRYPTION_KEY")
 
+fernet = Fernet(FERNET_KEY)
+
+def encrypt_secret(secret: str) -> str:
+    return fernet.encrypt(secret.encode()).decode()
+
+def decrypt_secret(encrypted_secret: str) -> str:
+    return fernet.decrypt(encrypted_secret.encode()).decode()
 
 def get_user_id_from_token():
     '''
@@ -63,6 +72,7 @@ def enable_2fa():
         return jsonify({"error": "Unauthorized"}), 401
 
     temp_secret = pyotp.random_base32()
+    encrypted_temp_secret = encrypt_secret(temp_secret)
 
     totp = pyotp.TOTP(temp_secret)
 
@@ -78,7 +88,7 @@ def enable_2fa():
         UPDATE users
         SET otp_temp_secret = %s
         WHERE _id = %s
-    """, (temp_secret, user_id))
+    """, (encrypted_temp_secret, user_id))
 
     conn.commit()
     cur.close()
@@ -120,21 +130,22 @@ def confirm_2fa():
     if not row or not row[0]:
         return jsonify({"error": "2FA not initialized"}), 400
 
-    temp_secret = row[0]
+    temp_secret = decrypt_secret(row[0])
 
     totp = pyotp.TOTP(temp_secret)
 
     if not totp.verify(code, valid_window=1):
         return jsonify({"error": "Invalid code"}), 401
 
-    #  dopiero teraz aktywujemy
+    encrypted_secret = encrypt_secret(temp_secret)
+
     cur.execute("""
         UPDATE users
         SET otp_secret = %s,
             otp_temp_secret = NULL,
             is_2fa_enabled = TRUE
         WHERE _id = %s
-    """, (temp_secret, user_id))
+    """, (encrypted_secret, user_id))
 
     conn.commit()
     cur.close()
@@ -237,7 +248,7 @@ def verify_2fa():
         if not row or not row[0]:
             return jsonify({"error": "2FA not enabled"}), 400
 
-        secret = row[0]
+        secret = decrypt_secret(row[0])
         totp = pyotp.TOTP(secret)
 
         key = f"2fa:{user_id}"
@@ -268,14 +279,14 @@ def verify_2fa():
         response.set_cookie(
             "access_token", access_token,
             httponly=True,
-            secure=False,
+            secure=False, # change to True in production
             samesite="lax",
             max_age=15*60  # 15 minutes
         )
         response.set_cookie(
             "refresh_token", refresh_token,
             httponly=True,
-            secure=False,
+            secure=False, # change to True in production
             samesite="lax",
             max_age=60*60  # 1 hour
         )
