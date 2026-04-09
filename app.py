@@ -14,6 +14,8 @@ from cryptography.fernet import Fernet
 import string
 import random
 import secrets
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError
 
 app = Flask(__name__)
 
@@ -53,16 +55,18 @@ def generate_backup_codes(n=10, length=8):
     alphabet = string.ascii_uppercase + string.digits
     return [''.join(secrets.choice(alphabet) for _ in range(length)) for _ in range(n)]
 
+ph = PasswordHasher()
+
 def store_backup_codes(user_id, codes):
-    """Stores the list of backup codes in the backup_codes table, each as a separate record"""
+    """Stores backup codes hashed with Argon2"""
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
 
     for code in codes:
-        encrypted = encrypt_secret(code)
+        hashed = ph.hash(code)
         cur.execute(
             "INSERT INTO backup_codes (user_id, code) VALUES (%s, %s)",
-            (user_id, encrypted)
+            (user_id, hashed)
         )
 
     conn.commit()
@@ -338,11 +342,10 @@ def verify_2fa():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-from flask import Flask, request, jsonify
 
 @app.route("/verify-backup-code", methods=["DELETE"])
 def verify_backup_code():
-    '''Verifies the backup code entered by the user against the codes stored in the database'''
+    """Verifies backup code using Argon2 hashes"""
     user_id = get_user_id_from_token()
     code = request.json.get("code")
 
@@ -352,8 +355,10 @@ def verify_backup_code():
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
 
-    # get all backup codes for the user
-    cur.execute("SELECT id, code FROM backup_codes WHERE user_id = %s", (user_id,))
+    cur.execute(
+        "SELECT id, code FROM backup_codes WHERE user_id = %s",
+        (user_id,)
+    )
     rows = cur.fetchall()
 
     if not rows:
@@ -362,20 +367,24 @@ def verify_backup_code():
         return jsonify({"error": "No backup codes available"}), 400
 
     matched_id = None
-    for row in rows:
-        backup_id, encrypted_code = row
-        if decrypt_secret(encrypted_code) == code:
-            matched_id = backup_id
-            break
+
+    for backup_id, code_hash in rows:
+        try:
+            if ph.verify(code_hash, code):
+                matched_id = backup_id
+                break
+        except VerifyMismatchError:
+            continue
 
     if not matched_id:
         cur.close()
         conn.close()
         return jsonify({"error": "Invalid backup code"}), 401
 
-    # delete the used backup code
+    # delete used code
     cur.execute("DELETE FROM backup_codes WHERE id = %s", (matched_id,))
     conn.commit()
+
     cur.close()
     conn.close()
 
@@ -398,6 +407,5 @@ def verify_backup_code():
     response.set_cookie("refresh_token", refresh_token, httponly=True, secure=False, samesite="lax", max_age=60*60)
 
     return response
-
 if __name__ == "__main__":
     app.run(debug=True)
