@@ -48,7 +48,33 @@ def encrypt_secret(secret: str) -> str:
 def decrypt_secret(encrypted_secret: str) -> str:
     return fernet.decrypt(encrypted_secret.encode()).decode()
 
+def generate_tokens(user_id):
+    access_payload = {
+        "sub": user_id,
+        "2fa": True,
+        "exp": datetime.datetime.utcnow() + datetime.timedelta(minutes=15)
+    }
 
+    refresh_payload = {
+        "sub": user_id,
+        "2fa": True,
+        "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+    }
+
+    return (
+        jwt.encode(access_payload, JWT_ACCESS_SECRET, algorithm="HS256"),
+        jwt.encode(refresh_payload, JWT_REFRESH_SECRET, algorithm="HS256")
+    )
+
+def make_auth_response(payload, user_id):
+    response = jsonify(payload)
+
+    access_token, refresh_token = generate_tokens(user_id)
+
+    response.set_cookie("access_token", access_token, httponly=True, secure=False, samesite="lax", max_age=15*60)
+    response.set_cookie("refresh_token", refresh_token, httponly=True, secure=False, samesite="lax", max_age=60*60)
+
+    return response
 
 def generate_backup_codes(n=10, length=8):
     """Generates a list of n random backup codes, each of specified length"""
@@ -90,16 +116,24 @@ def get_user_id_from_token():
     except Exception:
         return None
 
+from functools import wraps
+
+def require_auth(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        user_id = get_user_id_from_token()
+        if not user_id:
+            return jsonify({"error": "Unauthorized"}), 401
+        return f(user_id, *args, **kwargs)
+    return wrapper
+
 @app.route("/enable-2fa", methods=["PATCH"])
-def enable_2fa():
+@require_auth
+def enable_2fa(user_id):
     '''
     Generates a temporary secret for 2FA setup, creates a provisioning URI, and returns a QR code for the user to scan 
     The temporary secret is stored in the database until the user confirms 2FA setup
     '''
-    user_id = get_user_id_from_token()
-
-    if not user_id:
-        return jsonify({"error": "Unauthorized"}), 401
 
     temp_secret = pyotp.random_base32()
     encrypted_temp_secret = encrypt_secret(temp_secret)
@@ -137,15 +171,15 @@ def enable_2fa():
 
 
 @app.route("/confirm-2fa", methods=["POST"])
-def confirm_2fa():
+@require_auth
+def confirm_2fa(user_id):
     '''
     Verifies the 2FA code entered by the user against the temporary secret stored in the database
     If the code is valid, the temporary secret is promoted to the permanent otp_secret, and 2FA is enabled for the user
     '''
-    user_id = get_user_id_from_token()
     code = request.json.get("code")
 
-    if not user_id or not code:
+    if not code:
         return jsonify({"error": "Invalid request"}), 400
 
     conn = psycopg2.connect(DATABASE_URL)
@@ -193,14 +227,12 @@ def confirm_2fa():
 
 
 @app.route("/disable-2fa", methods=["PATCH"])
-def disable_2fa():
+@require_auth
+def disable_2fa(user_id):
     '''
     Disables 2FA for the user by clearing otp_secret, otp_temp_secret,
     is_2fa_enabled, and deleting all backup codes for the user
     '''
-    user_id = get_user_id_from_token()
-    if not user_id:
-        return jsonify({"error": "Unauthorized"}), 401
 
     try:
         conn = psycopg2.connect(DATABASE_URL)
@@ -231,13 +263,11 @@ def disable_2fa():
 
 
 @app.route("/is-2fa-enabled", methods=["GET"])
-def is_2fa_enabled():
+@require_auth
+def is_2fa_enabled(user_id):
     '''
     Checks if 2FA is enabled for the user by querying the is_2fa_enabled field in the database
     '''
-    user_id = get_user_id_from_token()
-    if not user_id:
-        return jsonify({"error": "Unauthorized"}), 401
 
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
@@ -264,15 +294,12 @@ def is_rate_limited(user_id, limit=5):
     return attempts is not None and int(attempts) >= limit
 
 @app.route("/verify-2fa", methods=["PATCH"])
-def verify_2fa():
+@require_auth
+def verify_2fa(user_id):
     '''
     Verifies the 2FA code entered by the user against the otp_secret stored in the database
     If the code is valid, generates access and refresh tokens, and returns them in httpOnly cookies
     '''
-    user_id = get_user_id_from_token()
-
-    if not user_id:
-        return jsonify({"error": "Unauthorized"}), 401
     
     if is_rate_limited(user_id):
         return jsonify({"error": "Too many attempts. Try again later."}), 429
@@ -305,51 +332,20 @@ def verify_2fa():
                 r.expire(key, 300)  # 5 min
             return jsonify({"error": "Invalid code"}), 401
 
-        access_payload = {
-            "sub": user_id,
-            "2fa": True,
-            "exp": datetime.datetime.utcnow() + datetime.timedelta(minutes=15)
-        }
-        access_token = jwt.encode(access_payload, JWT_ACCESS_SECRET, algorithm="HS256")
-
-        refresh_payload = {
-            "sub": user_id,
-            "2fa": True,
-            "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=1)
-        }
-        refresh_token = jwt.encode(refresh_payload, JWT_REFRESH_SECRET, algorithm="HS256")
-
-        response = jsonify({"message": "2FA verified"})
-
-        response.set_cookie(
-            "access_token", access_token,
-            httponly=True,
-            secure=False, # change to True in production
-            samesite="lax",
-            max_age=15*60  # 15 minutes
-        )
-        response.set_cookie(
-            "refresh_token", refresh_token,
-            httponly=True,
-            secure=False, # change to True in production
-            samesite="lax",
-            max_age=60*60  # 1 hour
-        )
-
         r.delete(f"2fa:{user_id}")  # reset attempt counter on successful verification
-        return response
+        return make_auth_response({"message": "2FA verified"}, user_id)
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/verify-backup-code", methods=["DELETE"])
-def verify_backup_code():
+@require_auth
+def verify_backup_code(user_id):
     """Verifies backup code using Argon2 hashes"""
-    user_id = get_user_id_from_token()
     code = request.json.get("code")
 
-    if not user_id or not code:
+    if not code:
         return jsonify({"error": "Invalid request"}), 400
 
     conn = psycopg2.connect(DATABASE_URL)
@@ -388,24 +384,7 @@ def verify_backup_code():
     cur.close()
     conn.close()
 
-    access_payload = {
-        "sub": user_id,
-        "2fa": True,
-        "exp": datetime.datetime.utcnow() + datetime.timedelta(minutes=15)
-    }
-    access_token = jwt.encode(access_payload, JWT_ACCESS_SECRET, algorithm="HS256")
+    return make_auth_response({"message": "Backup code verified"}, user_id)
 
-    refresh_payload = {
-        "sub": user_id,
-        "2fa": True,
-        "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=1)
-    }
-    refresh_token = jwt.encode(refresh_payload, JWT_REFRESH_SECRET, algorithm="HS256")
-
-    response = jsonify({"message": "Backup code verified"})
-    response.set_cookie("access_token", access_token, httponly=True, secure=False, samesite="lax", max_age=15*60)
-    response.set_cookie("refresh_token", refresh_token, httponly=True, secure=False, samesite="lax", max_age=60*60)
-
-    return response
 if __name__ == "__main__":
     app.run(debug=True)
