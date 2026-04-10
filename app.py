@@ -262,30 +262,45 @@ def disable_2fa(user_id):
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/is-2fa-enabled", methods=["GET"])
+@app.route("/2fa-info", methods=["GET"])
 @require_auth
-def is_2fa_enabled(user_id):
+def twofa_info(user_id):
     '''
-    Checks if 2FA is enabled for the user by querying the is_2fa_enabled field in the database
+    Checks if 2FA is enabled for the user and if so, counts how many backup codes are left
     '''
-
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
 
+    # 1. 2FA status
     cur.execute("""
         SELECT is_2fa_enabled
         FROM users
         WHERE _id = %s
     """, (user_id,))
+    user_row = cur.fetchone()
 
-    row = cur.fetchone()
+    if not user_row:
+        cur.close()
+        conn.close()
+        return jsonify({"error": "User not found"}), 404
+
+    is_2fa_enabled = user_row[0]
+
+    # 2. backup codes count
+    cur.execute("""
+        SELECT COUNT(*)
+        FROM backup_codes
+        WHERE user_id = %s
+    """, (user_id,))
+    backup_count = cur.fetchone()[0]
+
     cur.close()
     conn.close()
 
-    if not row:
-        return jsonify({"error": "User not found"}), 404
-
-    return jsonify({"isTwoFactorEnabled": row[0]})
+    return jsonify({
+        "isTwoFactorEnabled": is_2fa_enabled,
+        "backupCodesLeft": backup_count
+    })
 
 
 def is_rate_limited(user_id, limit=5):
