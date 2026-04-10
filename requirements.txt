@@ -1,7 +1,7 @@
 Flask
 pyotp
 PyJWT
-qrcode
+qrcode[pil]
 psycopg2-binary
 flask-cors
 python-dotenv
