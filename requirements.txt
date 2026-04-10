@@ -1,0 +1,10 @@
+Flask
+pyotp
+PyJWT
+qrcode
+psycopg2-binary
+flask-cors
+python-dotenv
+redis
+cryptography
+argon2-cffi

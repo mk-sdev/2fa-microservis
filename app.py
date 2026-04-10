@@ -19,7 +19,7 @@ from argon2.exceptions import VerifyMismatchError
 
 app = Flask(__name__)
 
-r = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+r = redis.Redis(host="redis", port=6379, db=0, decode_responses=True)
 
 CORS(
     app,
@@ -387,4 +387,4 @@ def verify_backup_code(user_id):
     return make_auth_response({"message": "Backup code verified"}, user_id)
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=True)
