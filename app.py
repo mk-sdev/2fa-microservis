@@ -386,5 +386,71 @@ def verify_backup_code(user_id):
 
     return make_auth_response({"message": "Backup code verified"}, user_id)
 
+@app.route("/regenerate-backup-codes", methods=["POST"])
+@require_auth
+def regenerate_backup_codes(user_id):
+    password = request.json.get("password")
+
+    if not password:
+        return jsonify({"error": "Password is required"}), 400
+
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
+
+        # get user's password hash
+        cur.execute("""
+            SELECT password
+            FROM users
+            WHERE _id = %s
+        """, (user_id,))
+
+        row = cur.fetchone()
+
+        if not row:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "User not found"}), 404
+
+        password_hash = row[0]
+
+        # verify password using Argon2
+        try:
+            ph.verify(password_hash, password)
+        except VerifyMismatchError:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Invalid password"}), 401
+
+        # delete old backup codes
+        cur.execute("""
+            DELETE FROM backup_codes
+            WHERE user_id = %s
+        """, (user_id,))
+
+        # generate new ones
+        new_codes = generate_backup_codes()
+
+        # save them hashed in the database
+        for code in new_codes:
+            hashed = ph.hash(code)
+            cur.execute(
+                "INSERT INTO backup_codes (user_id, code) VALUES (%s, %s)",
+                (user_id, hashed)
+            )
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        # return plain codes to the user
+        return jsonify({
+            "message": "Backup codes regenerated",
+            "backup_codes": new_codes
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
